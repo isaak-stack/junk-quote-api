@@ -20,7 +20,7 @@ PRICING TIERS:
 - Surcharges: mattress +$25 each, tire +$15 each, piano/safe: flag as call_for_quote
 - Hazmat (paint cans, chemicals, asbestos): flag as hazmat, no price
 
-JSON schema:
+Return this exact JSON schema:
 {
   "priceRange": "$175-$249",
   "truckLoad": "Quarter truck",
@@ -31,8 +31,10 @@ JSON schema:
   "notes": "One sentence with estimate rationale and any caveats."
 }
 
-confidence: high or medium or low
-flag: null or needs_more_photos or hazmat or call_for_quote`;
+confidence must be high, medium, or low.
+flag must be null, needs_more_photos, hazmat, or call_for_quote.`;
+
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Junk Quote API running' }));
 
 app.post('/api/quote', async (req, res) => {
   const { imageBase64, imageMime = 'image/jpeg' } = req.body;
@@ -62,4 +64,5 @@ app.post('/api/quote', async (req, res) => {
   }
 });
 
-app.listen(process.env.PORT || 3000, () => console.log('Quote API running'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => console.log('Quote API running on port ' + PORT));
