@@ -23,7 +23,7 @@ LOCAL MARKET RATES (Fresno/Central Valley, 2025-2026):
 - Our pricing is competitive but slightly below franchise rates to win local market share
 
 PRICING TIERS (based on truck volume):
-- Single item / minimum: $99-$149
+- Single item / minimum: $175
 - Quarter truck (1-3 items, small pile): $175-$249
 - Half truck (medium load, partial room): $299-$399
 - Three-quarter truck (large load, most of a room): $399-$499
@@ -128,6 +128,24 @@ app.post('/api/quote', async (req, res) => {
       });
     }
 
+    // Enforce $175 minimum floor on priceRange
+    const MINIMUM_JOB = 175;
+    if (parsed.priceRange) {
+      const rangeMatch = parsed.priceRange.match(/\$(\d+)/g);
+      if (rangeMatch && rangeMatch.length >= 2) {
+        const lo = Math.max(parseInt(rangeMatch[0].slice(1)), MINIMUM_JOB);
+        const hi = Math.max(parseInt(rangeMatch[1].slice(1)), MINIMUM_JOB);
+        parsed.priceRange = '$' + lo + '-$' + hi;
+      }
+    }
+    // Add negotiationFloor (40% below midpoint)
+    if (parsed.priceRange) {
+      const nums = parsed.priceRange.match(/\$(\d+)/g);
+      if (nums && nums.length >= 2) {
+        const mid = Math.round((parseInt(nums[0].slice(1)) + parseInt(nums[1].slice(1))) / 2);
+        parsed.negotiationFloor = Math.round(mid * 0.60);
+      }
+    }
     res.json(parsed);
   } catch (err) {
     console.error('Quote API error:', err?.status, err?.message);
