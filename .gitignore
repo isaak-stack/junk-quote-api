@@ -1,0 +1,30 @@
+# Secrets & credentials — NEVER commit these
+.env
+.env.*
+*.env
+*.pem
+*.key
+credentials.json
+service-account*.json
+
+# Node artifacts
+node_modules/
+npm-debug.log*
+package-lock.json.backup
+
+# Test images (not for production repo)
+test-images/
+test-images/*
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+*.tmp
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
