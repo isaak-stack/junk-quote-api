@@ -1,12 +1,31 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
+const Anthropic = require('@anthropic-ai/sdk');
 require('dotenv').config();
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb' }));
+
+// ===========================
+// ANTHROPIC CLIENT
+// ===========================
+// Uses ANTHROPIC_API_KEY from Railway env vars. If missing, calls will
+// fail fast and classifyImagesAI() falls back to manual_review.
+const VISION_MODEL = 'claude-sonnet-4-6';
+const ALLOWED_MATERIALS = [
+  'general_household', 'furniture', 'appliances', 'yard_waste',
+  'construction_debris', 'heavy_materials', 'concrete', 'mattresses',
+  'ewaste', 'recyclable_metal', 'mixed'
+];
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
+if (!anthropic) {
+  console.warn('[vision] ANTHROPIC_API_KEY not set — classifyImagesAI will return fallback for every request');
+}
 
 // Initialize Firebase Admin SDK with placeholder config
 // In production, load from environment variable or service account file
@@ -98,62 +117,280 @@ const PRICING = {
 };
 
 // ===========================
-// AI CLASSIFICATION (MOCK/PLACEHOLDER)
+// AI CLASSIFICATION (Claude Sonnet 4.6 vision)
 // ===========================
 /**
- * Mock AI classification function.
- * In production, replace the body with actual OpenAI GPT-4V API call.
+ * Vision-based junk classification using Anthropic Claude Sonnet 4.6.
  *
- * @param {Array<string>} base64Images - Array of base64-encoded images
- * @param {string} imageMime - MIME type (e.g., 'image/jpeg')
- * @param {string} address - Optional address for context
- * @returns {Object} Classification with estimated_cubic_yards, materials, confidence, item_flags, dump_items, items_spotted, notes
+ * Returns the same shape the rest of the pipeline (calculateQuote,
+ * buildAdjustedPrice, formatQuoteForFrontend) already depends on.
+ *
+ * Behavior:
+ *   - On API success + valid JSON: returns Claude's validated classification.
+ *   - On JSON parse failure OR API failure OR missing API key:
+ *     returns a low-confidence fallback ({ confidence: 0.3, ... }) which
+ *     downstream logic routes to manual_review.
+ *   - Writes every call to Firestore `quote_audit_log` (fire-and-forget).
+ *
+ * @param {Array<string>} base64Images - base64-encoded images (no data: prefix)
+ * @param {string} imageMime - e.g., 'image/jpeg'
+ * @param {string} address  - optional customer address for context
+ * @returns {Promise<Object>}
  */
-async function classifyImagesAI(base64Images, imageMime = 'image/jpeg', address = '') {
-  // PLACEHOLDER: This should be replaced with actual OpenAI GPT-4V API call
-  // Real implementation would look like:
-  // const response = await openai.vision.create({
-  //   model: 'gpt-4-vision-preview',
-  //   messages: [{
-  //     role: 'user',
-  //     content: [
-  //       { type: 'text', text: 'Classify the junk in these images...' },
-  //       ...base64Images.map(img => ({
-  //         type: 'image_url',
-  //         image_url: { url: `data:${imageMime};base64,${img}` }
-  //       }))
-  //     ]
-  //   }]
-  // });
+const CLASSIFY_SYSTEM_PROMPT = `You are analyzing photos of junk piles for a residential junk removal company in Fresno, CA. Your job is to estimate the volume and materials so a pricing engine can generate an accurate quote.
 
-  // For now, return realistic mock classification data
-  // The structure matches what GPT-4V would return
-  const mockResponse = {
-    estimated_cubic_yards: 2.5,
-    materials: ['furniture', 'general_household'],
-    confidence: 0.85,
+For each set of images, analyze what's visible and return ONLY a JSON object with no surrounding text, matching this exact schema:
+
+{
+  "estimated_cubic_yards": <number, your best estimate of total volume in cubic yards>,
+  "materials": [<array of 1-3 material types from this allowed list: general_household, furniture, appliances, yard_waste, construction_debris, heavy_materials, concrete, mattresses, ewaste, recyclable_metal, mixed>],
+  "confidence": <number 0-1, how confident you are in this estimate>,
+  "item_flags": {
+    "longCarry": <boolean, true if items are far from a truck-accessible spot e.g. backyard, narrow side yard>,
+    "disassembly": <boolean, true if items like bed frames, large furniture need to be taken apart>,
+    "hoarding": <boolean, true if this appears to be a hoarding situation with items piled densely across a room/space>,
+    "elevator": <boolean, true if items are in an apartment building with visible stairs or elevator access needed>
+  },
+  "dump_items": {
+    "mattresses": <integer count of mattresses visible>,
+    "appliances": <integer count of large appliances: fridges, washers, dryers, stoves>,
+    "tires": <integer count of tires>,
+    "hazmat": <integer count of hazardous items: paint, chemicals, batteries, propane tanks>
+  },
+  "items_spotted": [<array of 3-8 strings, specific items you identified, e.g. "gray couch", "queen mattress", "garden hose">],
+  "notes": "<1-2 sentence summary of what you see and any access/complexity concerns>"
+}
+
+VOLUME REFERENCE (critical for accuracy):
+- 1 cubic yard = roughly the size of a washing machine
+- 2 cubic yards = a small couch
+- 3 cubic yards = a full pickup truck bed level
+- 6 cubic yards = half of a full-size dump truck
+- 9 cubic yards = three-quarters of a full-size dump truck
+- 12 cubic yards = a full-size dump truck
+- 15+ cubic yards = multiple loads
+
+CONFIDENCE CALIBRATION:
+- 0.85-0.95: Clear daylight photo, pile fully visible, items identifiable
+- 0.70-0.84: Decent photo but pile partially obscured, stacked, or tarped
+- 0.55-0.69: Significant obstruction, bad angle, or heavy tarp/covering
+- Below 0.50: Photo is genuinely unusable (blurry, dark, wrong subject)
+
+Default to 0.80+ for typical customer/rep photos taken in normal conditions. Only drop below 0.70 if you genuinely cannot see most of the pile.
+
+IMPORTANT — Multi-image interpretation:
+
+If multiple images are provided, use visual cues to determine whether they show:
+
+(a) Different angles of the SAME pile at ONE location (most common — customer uploads 2-3 angles of their one pile)
+    → Estimate the pile ONCE based on the best view across all images. Do not sum volumes.
+
+(b) DIFFERENT piles at the same property (e.g., "backyard pile + garage pile + side yard pile")
+    → Sum the volumes across images.
+
+(c) Different job sites entirely (different addresses or buildings visible)
+    → This should not happen in a single call. If you see this, report the largest pile and flag the concern in the notes field.
+
+When uncertain between (a) and (b), lean toward (a) — treat as same pile. Customers usually upload different angles, not different piles.
+
+Return ONLY the JSON object. No markdown code fences, no surrounding explanation.`;
+
+function _clamp(n, lo, hi) {
+  const x = typeof n === 'number' && !Number.isNaN(n) ? n : lo;
+  return Math.max(lo, Math.min(hi, x));
+}
+
+function _fallbackClassification(reason) {
+  return {
+    estimated_cubic_yards: 2.0,
+    materials: ['mixed'],
+    confidence: 0.3,
+    item_flags: { longCarry: false, disassembly: false, hoarding: false, elevator: false },
+    dump_items: { mattresses: 0, appliances: 0, tires: 0, hazmat: 0 },
+    items_spotted: [],
+    notes: 'AI response parse error — manual review required' + (reason ? ` (${reason})` : '')
+  };
+}
+
+function _validateClassification(raw) {
+  // Allowed-materials filter + clamp confidence + clamp cubic yards
+  const materials = Array.isArray(raw.materials)
+    ? raw.materials.filter(m => typeof m === 'string' && ALLOWED_MATERIALS.includes(m)).slice(0, 3)
+    : [];
+  if (!materials.length) materials.push('mixed');
+
+  const cy = _clamp(Number(raw.estimated_cubic_yards), 0.5, 20);
+  const confidence = _clamp(Number(raw.confidence), 0, 1);
+
+  const itemFlags = raw.item_flags && typeof raw.item_flags === 'object' ? raw.item_flags : {};
+  const dumpItems = raw.dump_items && typeof raw.dump_items === 'object' ? raw.dump_items : {};
+
+  return {
+    estimated_cubic_yards: cy,
+    materials,
+    confidence,
     item_flags: {
-      longCarry: false,
-      disassembly: true,
-      hoarding: false,
-      elevator: false,
+      longCarry:   !!itemFlags.longCarry,
+      disassembly: !!itemFlags.disassembly,
+      hoarding:    !!itemFlags.hoarding,
+      elevator:    !!itemFlags.elevator
     },
     dump_items: {
-      mattresses: 1,
-      appliances: 0,
-      tires: 0,
-      hazmat: 0,
+      mattresses:  Math.max(0, parseInt(dumpItems.mattresses) || 0),
+      appliances:  Math.max(0, parseInt(dumpItems.appliances) || 0),
+      tires:       Math.max(0, parseInt(dumpItems.tires)      || 0),
+      hazmat:      Math.max(0, parseInt(dumpItems.hazmat)     || 0)
     },
-    items_spotted: [
-      'couch',
-      'bed frame',
-      'nightstand',
-      'boxes of household items',
-    ],
-    notes: 'Second-floor bedroom clearance. Some disassembly required for bed frame.',
+    items_spotted: Array.isArray(raw.items_spotted)
+      ? raw.items_spotted.filter(s => typeof s === 'string').slice(0, 8)
+      : [],
+    notes: typeof raw.notes === 'string' ? raw.notes.slice(0, 500) : ''
   };
+}
 
-  return mockResponse;
+function _extractJson(text) {
+  // Claude sometimes wraps in ```json ... ``` even when asked not to; handle defensively.
+  if (!text) return null;
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced ? fenced[1] : text).trim();
+  try {
+    return JSON.parse(candidate);
+  } catch (_) {
+    // Last-resort: find first { ... } block
+    const braceStart = candidate.indexOf('{');
+    const braceEnd = candidate.lastIndexOf('}');
+    if (braceStart >= 0 && braceEnd > braceStart) {
+      try { return JSON.parse(candidate.slice(braceStart, braceEnd + 1)); } catch (_) {}
+    }
+    return null;
+  }
+}
+
+function _logToFirestore(entry) {
+  // Fire-and-forget — never block the API response on log write.
+  if (!admin.apps.length) return;
+  admin.firestore().collection('quote_audit_log').add({
+    ...entry,
+    timestamp: admin.firestore.FieldValue.serverTimestamp()
+  }).catch(err => {
+    console.warn('[quote_audit_log] write failed:', err.message);
+  });
+}
+
+async function classifyImagesAI(base64Images, imageMime = 'image/jpeg', address = '') {
+  const startedAt = Date.now();
+  const images = Array.isArray(base64Images) ? base64Images.filter(Boolean) : [];
+
+  // Missing API key or no images → fallback immediately
+  if (!anthropic) {
+    const fallback = _fallbackClassification('ANTHROPIC_API_KEY not configured');
+    _logToFirestore({
+      image_count: images.length,
+      raw_response: '',
+      parsed_classification: fallback,
+      model_used: VISION_MODEL,
+      api_call_duration_ms: 0,
+      had_parse_error: false,
+      had_api_error: true,
+      fallback_triggered: true
+    });
+    return fallback;
+  }
+  if (!images.length) {
+    const fallback = _fallbackClassification('no images supplied');
+    _logToFirestore({
+      image_count: 0,
+      raw_response: '',
+      parsed_classification: fallback,
+      model_used: VISION_MODEL,
+      api_call_duration_ms: 0,
+      had_parse_error: false,
+      had_api_error: false,
+      fallback_triggered: true
+    });
+    return fallback;
+  }
+
+  // Build the multi-image user message
+  const mediaType = (imageMime || 'image/jpeg').replace(/^data:/, '').split(';')[0];
+  const content = [
+    {
+      type: 'text',
+      text: address
+        ? `Analyze the following ${images.length} photo(s) from this address: ${address}\nReturn the JSON classification per the schema.`
+        : `Analyze the following ${images.length} photo(s) of a junk pile. Return the JSON classification per the schema.`
+    },
+    ...images.map(b64 => ({
+      type: 'image',
+      source: { type: 'base64', media_type: mediaType, data: b64 }
+    }))
+  ];
+
+  let rawText = '';
+  let hadApiError = false;
+  let hadParseError = false;
+
+  try {
+    const resp = await anthropic.messages.create({
+      model: VISION_MODEL,
+      max_tokens: 1024,
+      system: CLASSIFY_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content }]
+    });
+
+    // Anthropic returns content as an array of blocks; grab text blocks.
+    rawText = (resp.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('\n')
+      .trim();
+
+    const parsed = _extractJson(rawText);
+    if (!parsed || typeof parsed !== 'object') {
+      hadParseError = true;
+      const fallback = _fallbackClassification('JSON parse failed');
+      console.warn('[vision] parse error — raw response:', rawText.slice(0, 500));
+      _logToFirestore({
+        image_count: images.length,
+        raw_response: rawText,
+        parsed_classification: fallback,
+        model_used: VISION_MODEL,
+        api_call_duration_ms: Date.now() - startedAt,
+        had_parse_error: true,
+        had_api_error: false,
+        fallback_triggered: true
+      });
+      return fallback;
+    }
+
+    const validated = _validateClassification(parsed);
+    _logToFirestore({
+      image_count: images.length,
+      raw_response: rawText,
+      parsed_classification: validated,
+      model_used: VISION_MODEL,
+      api_call_duration_ms: Date.now() - startedAt,
+      had_parse_error: false,
+      had_api_error: false,
+      fallback_triggered: false
+    });
+    return validated;
+  } catch (err) {
+    hadApiError = true;
+    console.error('[vision] Anthropic API error:', err.message);
+    const fallback = _fallbackClassification(`API error: ${err.message || 'unknown'}`);
+    _logToFirestore({
+      image_count: images.length,
+      raw_response: rawText,
+      parsed_classification: fallback,
+      model_used: VISION_MODEL,
+      api_call_duration_ms: Date.now() - startedAt,
+      had_parse_error: hadParseError,
+      had_api_error: true,
+      fallback_triggered: true
+    });
+    return fallback;
+  }
 }
 
 // ===========================
@@ -457,8 +694,25 @@ app.post('/api/quote', async (req, res) => {
       });
     }
 
-    // Step 1: Classify images using AI
-    const classification = await classifyImagesAI(images, imageMime, address);
+    // Step 1: Classify images using AI (always returns a valid shape — internal
+    // fallback yields { confidence: 0.3, ... } on API or parse failure so we
+    // gracefully degrade to manual_review instead of a 500).
+    let classification;
+    try {
+      classification = await classifyImagesAI(images, imageMime, address);
+    } catch (visionErr) {
+      // classifyImagesAI catches internally, but belt-and-suspenders here:
+      console.error('[route] Unexpected classifyImagesAI throw:', visionErr);
+      classification = {
+        estimated_cubic_yards: 2.0,
+        materials: ['mixed'],
+        confidence: 0.3,
+        item_flags: { longCarry: false, disassembly: false, hoarding: false, elevator: false },
+        dump_items: { mattresses: 0, appliances: 0, tires: 0, hazmat: 0 },
+        items_spotted: [],
+        notes: 'AI analysis unavailable — manual review required'
+      };
+    }
 
     // Step 2: Prepare input for pricing engine
     const quoteInput = {
@@ -475,7 +729,7 @@ app.post('/api/quote', async (req, res) => {
     // Step 3: Calculate quote
     const quoteEngine = calculateQuote(quoteInput);
 
-    // Step 4: Check if manual review needed
+    // Step 4: Check if manual review needed (low confidence routes here)
     if (quoteEngine.status === 'manual_review') {
       // Write to Firestore if Firebase is initialized
       if (admin.apps.length > 0) {
@@ -492,6 +746,9 @@ app.post('/api/quote', async (req, res) => {
           console.warn('Firestore write failed (check credentials):', firestoreError.message);
         }
       }
+      // Still return a 200 with the manual-review payload so the frontend
+      // can render the "we'll follow up" state instead of seeing a 5xx.
+      return res.json(formatQuoteForFrontend(quoteEngine, classification, quoteInput));
     }
 
     // Step 5: Format for frontend compatibility
@@ -500,9 +757,25 @@ app.post('/api/quote', async (req, res) => {
     res.json(formattedQuote);
   } catch (error) {
     console.error('Quote error:', error);
-    res.status(500).json({
-      error: 'Failed to generate quote',
-      details: error.message,
+    // Graceful fallback — frontend gets a parseable manual-review response
+    // rather than a hard 500. Status 200 keeps the retry-banner from firing
+    // on transient model hiccups.
+    res.status(200).json({
+      status: 'manual_review',
+      message: 'AI analysis unavailable — a team member will follow up shortly.',
+      priceRange: null,
+      confidence: 'low',
+      itemsSeen: [],
+      truckLoad: null,
+      notes: 'AI analysis unavailable — manual review required',
+      surcharges: [],
+      laborCost: 0,
+      dumpFee: 0,
+      surchargeTotal: 0,
+      crewSize: 0,
+      estimatedHours: 0,
+      negotiationFloor: null,
+      _error: error.message || 'unknown',
     });
   }
 });
@@ -672,3 +945,6 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+// Test-only export — used by test-vision.js to call the classifier directly
+// without going through the HTTP route. Leading __ flags it as non-public API.
+module.exports.__classifyImagesAI = classifyImagesAI;
